@@ -10,6 +10,10 @@ from models import *
 from utils.utils import *
 from torchvision.transforms import transforms as T
 from utils.datasets import LoadImagesAndLabels, JointDataset, collate_fn
+import torch
+import torch_xla.core.xla_model as xm
+import torch_xla.distributed.xla_multiprocessing as xmp
+import torch_xla.distributed.parallel_loader as pl
 
 def test(
         cfg,
@@ -21,7 +25,15 @@ def test(
         nms_thres=0.45,
         print_interval=40,
 ):
+    flags = {}
+    flags['batch_size'] = 32
+    flags['num_workers'] = 8
+    flags['num_epochs'] = 1
+    flags['seed'] = 1234
 
+    xmp.spawn(map_fn, args=(flags,), nprocs=8, start_method='fork')
+
+    device = xm.xla_device()  
     # Configure run
     f = open(data_cfg)
     data_cfg_dict = json.load(f)
@@ -35,6 +47,7 @@ def test(
 
     # Initialize model
     model = Darknet(cfg_dict, test_emb=False)
+    
 
     # Load weights
     if weights.endswith('.pt'):  # pytorch format
@@ -42,13 +55,13 @@ def test(
     else:  # darknet format
         load_darknet_weights(model, weights)
 
-    model = torch.nn.DataParallel(model)
-    model.cuda().eval()
+    # model = torch.nn.DataParallel(model)
+    model.to(device).eval()
 
     # Get dataloader
     transforms = T.Compose([T.ToTensor()])
     dataset = JointDataset(dataset_root, test_path, img_size, augment=False, transforms=transforms)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, 
+    test_loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, 
                                              num_workers=8, drop_last=False, collate_fn=collate_fn) 
 
     mean_mAP, mean_R, mean_P, seen = 0.0, 0.0, 0.0, 0
@@ -56,9 +69,10 @@ def test(
     outputs, mAPs, mR, mP, TP, confidence, pred_class, target_class, jdict = \
         [], [], [], [], [], [], [], [], []
     AP_accum, AP_accum_count = np.zeros(nC), np.zeros(nC)
+    dataloader = pl.ParallelLoader(test_loader, [device]).per_device_loader(device)
     for batch_i, (imgs, targets, paths, shapes, targets_len) in enumerate(dataloader):
         t = time.time()
-        output = model(imgs.cuda())
+        output = model(imgs.to(device))
         output = non_max_suppression(output, conf_thres=conf_thres, nms_thres=nms_thres)
         for i, o in enumerate(output):
             if o is not None:
@@ -154,7 +168,15 @@ def test_emb(
             nms_thres=0.45,
             print_interval=40,
 ):
+    flags = {}
+    flags['batch_size'] = 32
+    flags['num_workers'] = 8
+    flags['num_epochs'] = 1
+    flags['seed'] = 1234
 
+    xmp.spawn(map_fn, args=(flags,), nprocs=8, start_method='fork')
+
+    device = xm.xla_device()  
     # Configure run
     f = open(data_cfg)
     data_cfg_dict = json.load(f)
@@ -173,19 +195,20 @@ def test_emb(
     else:  # darknet format
         load_darknet_weights(model, weights)
 
-    model = torch.nn.DataParallel(model)
-    model.cuda().eval()
+    # model = torch.nn.DataParallel(model)
+    model.to(device).eval()
 
     # Get dataloader
     transforms = T.Compose([T.ToTensor()])
     dataset = JointDataset(dataset_root, test_paths, img_size, augment=False, transforms=transforms)
-    dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, 
+    test_loader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=False, 
                                              num_workers=8, drop_last=False, collate_fn=collate_fn) 
     embedding, id_labels = [], []
     print('Extracting pedestrain features...')
+    dataloader = pl.ParallelLoader(test_loader, [device]).per_device_loader(device)
     for batch_i, (imgs, targets, paths, shapes, targets_len) in enumerate(dataloader):
         t = time.time()
-        output = model(imgs.cuda(), targets.cuda(), targets_len.cuda()).squeeze()
+        output = model(imgs.to(device), targets.to(device), targets_len.to(device)).squeeze()
 
         for out in output:
             feat, label = out[:-1], out[-1].long()
@@ -199,7 +222,7 @@ def test_emb(
     print('Computing pairwise similairity...')
     if len(embedding) <1 :
         return None
-    embedding = torch.stack(embedding, dim=0).cuda()
+    embedding = torch.stack(embedding, dim=0)
     id_labels = torch.LongTensor(id_labels)
     n = len(id_labels)
     print(n, len(embedding))
@@ -223,6 +246,11 @@ def test_emb(
 
 
 if __name__ == '__main__':
+        # Spawns eight of the map functions, one for each of the eight cores on
+    # the Cloud TPU
+    flags = {}
+    # Note: Colab only supports start_method='fork'
+    xmp.spawn(simple_map_fn, args=(flags,), nprocs=8, start_method='fork')
     parser = argparse.ArgumentParser(prog='test.py')
     parser.add_argument('--batch-size', type=int, default=40, help='size of each image batch')
     parser.add_argument('--cfg', type=str, default='cfg/yolov3.cfg', help='cfg file path')
@@ -246,7 +274,7 @@ if __name__ == '__main__':
                 opt.iou_thres,
                 opt.conf_thres,
                 opt.nms_thres,
-                opt.print_interval,
+                opt.print_interval
             )
         else:
             mAP = test(
@@ -257,6 +285,5 @@ if __name__ == '__main__':
                 opt.iou_thres,
                 opt.conf_thres,
                 opt.nms_thres,
-                opt.print_interval,
+                opt.print_interval
             )
-
