@@ -9,7 +9,8 @@ from utils.datasets import JointDataset, collate_fn
 from utils.utils import *
 from utils.log import logger
 from torchvision.transforms import transforms as T
-
+import torch_xla
+import torch_xla.core.xla_model as xm
 
 def train(
         cfg,
@@ -24,6 +25,7 @@ def train(
         accumulated_batches=1,
         freeze_backbone=False,
         opt=None,
+        workers = 8
 ):
     # The function starts
 
@@ -36,7 +38,7 @@ def train(
     if resume:
         latest_resume = osp.join(weights_from, 'latest.pt')
 
-    torch.backends.cudnn.benchmark = True  # unsuitable for multiscale
+#     torch.backends.cudnn.benchmark = True  # unsuitable for multiscale
 
     # Configure run
     f = open(data_cfg)
@@ -49,9 +51,11 @@ def train(
     # Get dataloader
     dataset = JointDataset(dataset_root, trainset_paths, img_size, augment=True, transforms=transforms)
     dataloader = torch.utils.data.DataLoader(dataset, batch_size=batch_size, shuffle=True,
-                                             num_workers=8, pin_memory=True, drop_last=True, collate_fn=collate_fn)
+                                             num_workers=workers, pin_memory=True, drop_last=True, collate_fn=collate_fn)
     # Initialize model
+    device = xm.xla_device()
     model = Darknet(cfg, dataset.nID)
+    
 
     cutoff = -1  # backbone reaches to cutoff layer
     start_epoch = 0
@@ -60,7 +64,7 @@ def train(
 
         # Load weights to resume from
         model.load_state_dict(checkpoint['model'])
-        model.cuda().train()
+        model.train().to(device)
 
         # Set optimizer
         optimizer = torch.optim.SGD(filter(lambda x: x.requires_grad, model.parameters()), lr=opt.lr, momentum=.9)
@@ -80,13 +84,12 @@ def train(
             load_darknet_weights(model, osp.join(weights_from, 'yolov3-tiny.conv.15'))
             cutoff = 15
 
-        model.cuda().train()
+        model.train().to(device)
 
         # Set optimizer
         optimizer = torch.optim.SGD(filter(lambda x: x.requires_grad, model.parameters()), lr=opt.lr, momentum=.9,
                                     weight_decay=1e-4)
 
-    model = torch.nn.DataParallel(model)
     # Set scheduler
     scheduler = torch.optim.lr_scheduler.MultiStepLR(optimizer,
                                                      milestones=[int(0.5 * opt.epochs), int(0.75 * opt.epochs)],
@@ -125,7 +128,8 @@ def train(
                     g['lr'] = lr
 
             # Compute loss, compute gradient, update parameters
-            loss, components = model(imgs.cuda(), targets.cuda(), targets_len.cuda())
+            # print(device, type(device), imgs.to(device).device)
+            loss, components = model(imgs.to(device), targets.to(device), targets_len.to(device))
             components = torch.mean(components.view(-1, 5), dim=0)
             loss = torch.mean(loss)
             loss.backward()
@@ -137,6 +141,7 @@ def train(
 
             # Running epoch-means of tracked metrics
             ui += 1
+            xm.optimizer_step(optimizer, barrier=True)
 
             for ii, key in enumerate(model.module.loss_names):
                 rloss[key] = (rloss[key] * ui + components[ii]) / (ui + 1)
@@ -151,14 +156,15 @@ def train(
             t0 = time.time()
             if i % opt.print_interval == 0:
                 logger.info(s)
+            
 
         # Save latest checkpoint
         checkpoint = {'epoch': epoch,
                       'model': model.module.state_dict(),
                       'optimizer': optimizer.state_dict()}
 
-        copyfile(cfg, weights_to + '/cfg/yolo3.cfg')
-        copyfile(data_cfg, weights_to + '/cfg/ccmcpe.json')
+        copyfile(cfg, weights_to + '/yolo3.cfg')
+        copyfile(data_cfg, weights_to + '/ccmcpe.json')
 
         latest = osp.join(weights_to, 'latest.pt')
         torch.save(checkpoint, latest)
@@ -168,12 +174,11 @@ def train(
             torch.save(checkpoint, osp.join(weights_to, "weights_epoch_" + str(epoch) + ".pt"))
 
         # Calculate mAP
-        if epoch % opt.test_interval == 0:
-            with torch.no_grad():
-                mAP, R, P = test.test(cfg, data_cfg, weights=latest, batch_size=batch_size, img_size=img_size,
-                                      print_interval=40, nID=dataset.nID)
-                test.test_emb(cfg, data_cfg, weights=latest, batch_size=batch_size, img_size=img_size,
-                              print_interval=40, nID=dataset.nID)
+#         if epoch % opt.test_interval == 0:
+#             with torch.no_grad():
+#                 mAP, R, P = test.test(cfg, data_cfg, weights=latest, batch_size=batch_size,                                       print_interval=40)
+#                 test.test_emb(cfg, data_cfg, weights=latest, batch_size=batch_size, 
+#                               print_interval=40)
 
         # Call scheduler.step() after opimizer.step() with pytorch > 1.1.0
         scheduler.step()
@@ -200,6 +205,7 @@ if __name__ == '__main__':
     parser.add_argument('--test-interval', type=int, default=9, help='test interval')
     parser.add_argument('--lr', type=float, default=1e-2, help='init lr')
     parser.add_argument('--unfreeze-bn', action='store_true', help='unfreeze bn')
+    parser.add_argument('--num-worker', type=int, default=8, help='Data loader')
     opt = parser.parse_args()
 
     init_seeds()
@@ -216,4 +222,5 @@ if __name__ == '__main__':
         batch_size=opt.batch_size,
         accumulated_batches=opt.accumulated_batches,
         opt=opt,
+        workers=opt.num_worker
     )
