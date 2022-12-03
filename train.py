@@ -143,7 +143,7 @@ def train(
             ui += 1
             xm.optimizer_step(optimizer, barrier=True)
 
-            for ii, key in enumerate(model.module.loss_names):
+            for ii, key in enumerate(model.loss_names):
                 rloss[key] = (rloss[key] * ui + components[ii]) / (ui + 1)
 
             # rloss indicates running loss values with mean updated at every epoch
