@@ -84,7 +84,7 @@ def train(
             load_darknet_weights(model, osp.join(weights_from, 'yolov3-tiny.conv.15'))
             cutoff = 15
 
-        model.train().to(device)
+        model.to(device).train()
 
         # Set optimizer
         optimizer = torch.optim.SGD(filter(lambda x: x.requires_grad, model.parameters()), lr=opt.lr, momentum=.9,
